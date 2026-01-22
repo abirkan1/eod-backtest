@@ -2,10 +2,12 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from datetime import date
+import inspect
 
 from data import load_daily_data
 from backtester import run_backtest
 from metrics import compute_metrics, monthly_returns_table, compute_equity_curve
+
 
 st.set_page_config(page_title="EOD Backtesting Workbench (NIFTY & BANKNIFTY)", layout="wide")
 
@@ -14,24 +16,24 @@ st.caption("Signals on close (t), execution at next open (t+1). Long-only V1. Ya
 
 
 # -----------------------------
-# UI helpers
+# Formatting helpers
 # -----------------------------
-def _pct(x):
+def pct(x):
     try:
-        return f"{x:.2f}%"
+        return f"{float(x):.2f}%"
     except:
         return str(x)
 
 
-def _fmt(x):
+def money(x):
     try:
-        return f"{x:,.2f}"
+        return f"{float(x):,.2f}"
     except:
         return str(x)
 
 
 # -----------------------------
-# Sidebar
+# Sidebar UI
 # -----------------------------
 with st.sidebar:
     st.header("Universe")
@@ -63,7 +65,6 @@ with st.sidebar:
     )
 
     breakout_n = st.number_input("Breakout N", min_value=5, value=20, step=1)
-
     ema_fast = st.number_input("EMA fast", min_value=2, value=20, step=1)
     ema_slow = st.number_input("EMA slow", min_value=5, value=50, step=1)
 
@@ -95,7 +96,7 @@ with st.sidebar:
 
 
 # -----------------------------
-# Build config dicts
+# Build symbol list
 # -----------------------------
 symbols = []
 if use_nifty:
@@ -104,9 +105,13 @@ if use_bank:
     symbols.append("BANKNIFTY")
 
 if len(symbols) == 0:
-    st.warning("Select at least one symbol in Universe.")
+    st.warning("Select at least one symbol.")
     st.stop()
 
+
+# -----------------------------
+# Build config dicts
+# -----------------------------
 entry_cfg = {
     "use_breakout": "Breakout: Close > Highest(High, N)" in entry_conditions,
     "breakout_n": int(breakout_n),
@@ -138,13 +143,52 @@ sim_cfg = {
 
 
 # -----------------------------
-# Run
+# Robust runner for different backtester signatures
+# -----------------------------
+def call_run_backtest(symbol, data, entry_cfg, exit_cfg, sim_cfg):
+    """
+    Supports multiple versions of run_backtest() without breaking.
+    Tries:
+    1) Keyword args
+    2) Positional args
+    3) Other param names (data/df)
+    """
+    sig = inspect.signature(run_backtest)
+    params = list(sig.parameters.keys())
+
+    # Try keyword style
+    try:
+        kwargs = {}
+        for p in params:
+            if p in ("symbol", "sym", "ticker"):
+                kwargs[p] = symbol
+            elif p in ("data", "df", "prices"):
+                kwargs[p] = data
+            elif p in ("entry_cfg", "entry_config", "entry"):
+                kwargs[p] = entry_cfg
+            elif p in ("exit_cfg", "exit_config", "exit"):
+                kwargs[p] = exit_cfg
+            elif p in ("sim_cfg", "sim_config", "sim", "config"):
+                kwargs[p] = sim_cfg
+
+        if len(kwargs) > 0:
+            return run_backtest(**kwargs)
+    except Exception:
+        pass
+
+    # Fallback positional
+    try:
+        return run_backtest(symbol, data, entry_cfg, exit_cfg, sim_cfg)
+    except Exception as e:
+        raise e
+
+
+# -----------------------------
+# Main run
 # -----------------------------
 if run_btn:
     with st.spinner("Downloading data & running backtest..."):
-
         all_trades = []
-        all_equity = []
 
         for sym in symbols:
             df = load_daily_data(sym, pd.Timestamp(start), pd.Timestamp(end), source_choice="Yahoo Finance")
@@ -153,26 +197,31 @@ if run_btn:
                 st.warning(f"No data returned for {sym}. Skipping.")
                 continue
 
-            trades = run_backtest(
-                symbol=sym,
-                data=df,
-                entry_cfg=entry_cfg,
-                exit_cfg=exit_cfg,
-                sim_cfg=sim_cfg,
-            )
+            trades = call_run_backtest(sym, df, entry_cfg, exit_cfg, sim_cfg)
 
-            if trades is None or len(trades) == 0:
+            # Normalize trades output
+            if trades is None:
                 continue
 
-            all_trades.append(trades)
+            if isinstance(trades, list):
+                trades = pd.DataFrame(trades)
+
+            if isinstance(trades, pd.DataFrame) and len(trades) > 0:
+                all_trades.append(trades)
 
         if len(all_trades) == 0:
-            st.error("No trades generated. Try loosening entry rules (e.g. remove RSI filter).")
+            st.error("No trades generated. Try loosening entry rules (remove RSI / breakout etc).")
             st.stop()
 
         trades_df = pd.concat(all_trades, ignore_index=True)
 
-        # Build equity from trade PnL
+        # Force dates if present
+        if "EntryDate" in trades_df.columns:
+            trades_df["EntryDate"] = pd.to_datetime(trades_df["EntryDate"], errors="coerce")
+        if "ExitDate" in trades_df.columns:
+            trades_df["ExitDate"] = pd.to_datetime(trades_df["ExitDate"], errors="coerce")
+
+        # Compute equity + metrics (uses your fixed metrics.py)
         equity = compute_equity_curve(trades_df, initial_capital=sim_cfg["capital_per_trade"])
         metrics = compute_metrics(trades_df, initial_capital=sim_cfg["capital_per_trade"])
         monthly = monthly_returns_table(equity)
@@ -182,31 +231,29 @@ if run_btn:
     # -----------------------------
     # Summary
     # -----------------------------
-    col1, col2 = st.columns([1.05, 1.0])
+    col1, col2 = st.columns([1.1, 1.0])
 
     with col1:
         st.subheader("Summary")
+        a, b, c, d = st.columns(4)
+        a.metric("CAGR", pct(metrics.get("CAGR", 0)))
+        b.metric("Max DD", pct(metrics.get("MaxDrawdown", 0)))
+        c.metric("Trades", int(metrics.get("Trades", 0)))
+        d.metric("Profit Factor", f"{metrics.get('ProfitFactor', 0):.2f}")
 
-        # show key metrics in clean way
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("CAGR", _pct(metrics["CAGR"]))
-        m2.metric("Max DD", _pct(metrics["MaxDrawdown"]))
-        m3.metric("Trades", int(metrics["Trades"]))
-        m4.metric("Profit Factor", f'{metrics["ProfitFactor"]:.2f}')
+        e, f, g, h = st.columns(4)
+        e.metric("Win Rate", pct(metrics.get("WinRate", 0)))
+        f.metric("Sharpe", f"{metrics.get('Sharpe', 0):.2f}")
+        g.metric("Avg Win (₹)", money(metrics.get("AvgWin", 0)))
+        h.metric("Avg Loss (₹)", money(metrics.get("AvgLoss", 0)))
 
-        m5, m6, m7, m8 = st.columns(4)
-        m5.metric("Win Rate", _pct(metrics["WinRate"]))
-        m6.metric("Sharpe", f'{metrics["Sharpe"]:.2f}')
-        m7.metric("Avg Win (₹)", _fmt(metrics["AvgWin"]))
-        m8.metric("Avg Loss (₹)", _fmt(metrics["AvgLoss"]))
-
-        st.caption("Raw metrics JSON (for debugging)")
+        st.caption("Raw metrics JSON")
         st.json(metrics)
 
     with col2:
         st.subheader("Monthly Returns (%)")
         if monthly is None or monthly.empty:
-            st.info("Monthly table unavailable (not enough equity points).")
+            st.info("Monthly returns table not available (not enough points).")
         else:
             st.dataframe(monthly, use_container_width=True)
 
@@ -218,10 +265,10 @@ if run_btn:
     st.line_chart(eq_df)
 
     # -----------------------------
-    # Trades table + download
+    # Trades
     # -----------------------------
     st.subheader("Trades")
-    st.dataframe(trades_df, use_container_width=True, height=350)
+    st.dataframe(trades_df, use_container_width=True, height=400)
 
     csv = trades_df.to_csv(index=False).encode("utf-8")
     st.download_button(
