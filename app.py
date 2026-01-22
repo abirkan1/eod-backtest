@@ -4,12 +4,11 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from datetime import date, datetime
-from modules.data import load_daily_data
-from modules.indicators import ema, rsi, atr
-from modules.rules import build_entry_signal, build_exit_signal
-from modules.backtester import run_backtest
-from modules.metrics import compute_metrics, monthly_returns_table
-
+from data import load_daily_data
+from indicators import ema, rsi, atr
+from rules import build_entry_signal, build_exit_signal
+from backtester import run_backtest
+from metrics import compute_metrics, monthly_returns_table
 st.set_page_config(page_title="EOD Backtesting Workbench (NIFTY & BANKNIFTY)", layout="wide")
 
 st.title("EOD Backtesting Workbench — NIFTY & BANKNIFTY")
