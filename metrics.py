@@ -1,57 +1,199 @@
-
-import pandas as pd
 import numpy as np
+import pandas as pd
 
-def compute_metrics(equity: pd.DataFrame, trades: pd.DataFrame) -> dict:
-    if equity is None or equity.empty:
-        return {}
 
-    eq = equity["Equity"].copy().dropna()
-    # convert to returns (daily)
-    rets = eq.pct_change().dropna()
+def _safe_div(a, b):
+    if b == 0:
+        return np.nan
+    return a / b
 
-    # CAGR approximation
-    days = (eq.index[-1] - eq.index[0]).days
-    years = days / 365.25 if days > 0 else 0
-    cagr = (eq.iloc[-1] / eq.iloc[0]) ** (1/years) - 1 if years > 0 and eq.iloc[0] > 0 else np.nan
 
-    dd = eq / eq.cummax() - 1.0
-    max_dd = dd.min()
+def compute_equity_curve(trades: pd.DataFrame, initial_capital: float = 1_000_000.0) -> pd.Series:
+    """
+    Builds an equity curve from trade-level PnL.
+    Assumes trades contain:
+      - ExitDate
+      - NetPnL (preferred) or GrossPnL
+    """
+    if trades is None or trades.empty:
+        return pd.Series([initial_capital], index=[pd.Timestamp("2000-01-01")])
 
-    win_rate = float((trades["NetPnL"] > 0).mean()) if trades is not None and not trades.empty else np.nan
-    profit_factor = float(trades.loc[trades["NetPnL"] > 0, "NetPnL"].sum() / abs(trades.loc[trades["NetPnL"] < 0, "NetPnL"].sum())) if trades is not None and not trades.empty and (trades["NetPnL"] < 0).any() else np.nan
-    avg_win = float(trades.loc[trades["NetPnL"] > 0, "NetPnL"].mean()) if trades is not None and not trades.empty and (trades["NetPnL"] > 0).any() else np.nan
-    avg_loss = float(trades.loc[trades["NetPnL"] < 0, "NetPnL"].mean()) if trades is not None and not trades.empty and (trades["NetPnL"] < 0).any() else np.nan
-    expectancy = float(trades["NetPnL"].mean()) if trades is not None and not trades.empty else np.nan
+    df = trades.copy()
 
-    sharpe = (rets.mean() / (rets.std() + 1e-12)) * np.sqrt(252) if len(rets) > 2 else np.nan
+    if "ExitDate" not in df.columns:
+        # fallback if ExitDate missing
+        df["ExitDate"] = df.get("EntryDate", pd.Timestamp.today())
 
-    out = {
-        "CAGR": None if pd.isna(cagr) else round(float(cagr)*100, 2),
-        "MaxDrawdown": round(float(max_dd)*100, 2) if pd.notna(max_dd) else None,
-        "Trades": int(len(trades)) if trades is not None else 0,
-        "WinRate": None if pd.isna(win_rate) else round(win_rate*100, 2),
-        "ProfitFactor": None if pd.isna(profit_factor) else round(profit_factor, 3),
-        "AvgWin": None if pd.isna(avg_win) else round(avg_win, 2),
-        "AvgLoss": None if pd.isna(avg_loss) else round(avg_loss, 2),
-        "Expectancy": None if pd.isna(expectancy) else round(expectancy, 2),
-        "Sharpe": None if pd.isna(sharpe) else round(float(sharpe), 3),
+    df["ExitDate"] = pd.to_datetime(df["ExitDate"])
+
+    if "NetPnL" in df.columns:
+        pnl_col = "NetPnL"
+    elif "GrossPnL" in df.columns:
+        pnl_col = "GrossPnL"
+    else:
+        # nothing to compute
+        return pd.Series([initial_capital], index=[pd.Timestamp("2000-01-01")])
+
+    df[pnl_col] = pd.to_numeric(df[pnl_col], errors="coerce").fillna(0.0)
+
+    # sort by exit time
+    df = df.sort_values("ExitDate")
+
+    # cumulative equity
+    eq = initial_capital + df[pnl_col].cumsum()
+    eq.index = df["ExitDate"]
+
+    # ensure starts at initial
+    if len(eq) == 0:
+        return pd.Series([initial_capital], index=[pd.Timestamp("2000-01-01")])
+
+    return eq
+
+
+def _max_drawdown(equity: pd.Series) -> float:
+    if equity is None or len(equity) < 2:
+        return 0.0
+    peak = equity.cummax()
+    dd = (equity / peak) - 1.0
+    return float(dd.min() * 100.0)
+
+
+def _annualized_sharpe(daily_returns: pd.Series) -> float:
+    """
+    Daily returns assumed.
+    """
+    if daily_returns is None or len(daily_returns) < 10:
+        return 0.0
+    mu = daily_returns.mean()
+    sig = daily_returns.std(ddof=0)
+    if sig == 0:
+        return 0.0
+    return float((mu / sig) * np.sqrt(252))
+
+
+def compute_metrics(trades: pd.DataFrame, initial_capital: float = 1_000_000.0) -> dict:
+    """
+    Returns a metrics dict:
+    - CAGR (%)
+    - MaxDrawdown (%)
+    - Trades
+    - WinRate (%)
+    - ProfitFactor
+    - AvgWin / AvgLoss
+    - Expectancy (₹)
+    - Sharpe
+    """
+    if trades is None or trades.empty:
+        return {
+            "CAGR": 0.0,
+            "MaxDrawdown": 0.0,
+            "Trades": 0,
+            "WinRate": 0.0,
+            "ProfitFactor": 0.0,
+            "AvgWin": 0.0,
+            "AvgLoss": 0.0,
+            "Expectancy": 0.0,
+            "Sharpe": 0.0,
+        }
+
+    df = trades.copy()
+
+    # PnL column
+    if "NetPnL" in df.columns:
+        pnl_col = "NetPnL"
+    elif "GrossPnL" in df.columns:
+        pnl_col = "GrossPnL"
+    else:
+        # fallback
+        pnl_col = None
+
+    if pnl_col is None:
+        return {
+            "CAGR": 0.0,
+            "MaxDrawdown": 0.0,
+            "Trades": int(len(df)),
+            "WinRate": 0.0,
+            "ProfitFactor": 0.0,
+            "AvgWin": 0.0,
+            "AvgLoss": 0.0,
+            "Expectancy": 0.0,
+            "Sharpe": 0.0,
+        }
+
+    df[pnl_col] = pd.to_numeric(df[pnl_col], errors="coerce").fillna(0.0)
+
+    # equity curve (trade-based)
+    equity = compute_equity_curve(df, initial_capital=initial_capital)
+
+    # CAGR
+    if len(equity) < 2:
+        cagr = 0.0
+    else:
+        start = equity.index.min()
+        end = equity.index.max()
+        years = max((end - start).days / 365.25, 1e-9)
+        cagr = (equity.iloc[-1] / equity.iloc[0]) ** (1.0 / years) - 1.0
+        cagr = float(cagr * 100.0)
+
+    # Drawdown
+    max_dd = _max_drawdown(equity)
+
+    # Win/loss stats
+    wins = df[df[pnl_col] > 0][pnl_col]
+    losses = df[df[pnl_col] < 0][pnl_col]
+
+    n_trades = int(len(df))
+    winrate = float((len(wins) / n_trades) * 100.0) if n_trades > 0 else 0.0
+
+    gross_profit = float(wins.sum()) if len(wins) > 0 else 0.0
+    gross_loss = float(-losses.sum()) if len(losses) > 0 else 0.0
+
+    profit_factor = float(_safe_div(gross_profit, gross_loss)) if gross_loss > 0 else (999.0 if gross_profit > 0 else 0.0)
+
+    avg_win = float(wins.mean()) if len(wins) > 0 else 0.0
+    avg_loss = float(losses.mean()) if len(losses) > 0 else 0.0  # negative number
+
+    expectancy = float(df[pnl_col].mean()) if n_trades > 0 else 0.0
+
+    # Sharpe (approx using "daily" equity by forward-fill)
+    # Convert trade equity into daily equity
+    daily_eq = equity.resample("D").last().ffill()
+    daily_rets = daily_eq.pct_change().dropna()
+    sharpe = _annualized_sharpe(daily_rets)
+
+    return {
+        "CAGR": round(cagr, 4),
+        "MaxDrawdown": round(max_dd, 4),
+        "Trades": n_trades,
+        "WinRate": round(winrate, 4),
+        "ProfitFactor": round(profit_factor, 4),
+        "AvgWin": round(avg_win, 4),
+        "AvgLoss": round(avg_loss, 4),
+        "Expectancy": round(expectancy, 4),
+        "Sharpe": round(sharpe, 4),
     }
-    return out
 
-def monthly_returns_table(equity: pd.DataFrame) -> pd.DataFrame:
-    eq = equity["Equity"].dropna().copy()
-    # convert equity to monthly returns
-    m = eq.resample("M").last().pct_change().dropna()
-    if m.empty:
+
+def monthly_returns_table(equity_curve: pd.Series) -> pd.DataFrame:
+    """
+    Takes equity series and returns monthly % returns pivot.
+    """
+    if equity_curve is None or len(equity_curve) < 2:
         return pd.DataFrame()
-    m.index = pd.to_datetime(m.index)
-    df = m.to_frame("Return")
+
+    eq = equity_curve.resample("M").last().ffill()
+    rets = eq.pct_change().dropna() * 100.0
+    df = rets.to_frame("ret")
     df["Year"] = df.index.year
-    df["Month"] = df.index.month
-    pivot = df.pivot_table(index="Year", columns="Month", values="Return", aggfunc="sum").sort_index()
-    pivot = (pivot * 100).round(2)
-    # nice month names
-    month_map = {1:"Jan",2:"Feb",3:"Mar",4:"Apr",5:"May",6:"Jun",7:"Jul",8:"Aug",9:"Sep",10:"Oct",11:"Nov",12:"Dec"}
-    pivot = pivot.rename(columns=month_map)
-    return pivot
+    df["Month"] = df.index.strftime("%b")
+
+    pivot = df.pivot_table(index="Year", columns="Month", values="ret", aggfunc="sum")
+
+    # reorder months
+    month_order = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    for m in month_order:
+        if m not in pivot.columns:
+            pivot[m] = np.nan
+    pivot = pivot[month_order]
+
+    return pivot.round(2)
