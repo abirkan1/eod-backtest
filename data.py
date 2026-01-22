@@ -87,7 +87,35 @@ def _load_from_yahoo(symbol: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.
     for c in ["Open","High","Low","Close","Volume"]:
         if c not in df.columns:
             df[c] = pd.NA
-    return df[["Open","High","Low","Close","Volume"]].dropna(subset=["Open","High","Low","Close"])
+    # --- Robust column handling for Yahoo Finance ---
+df = df.copy()
+
+# Flatten columns if Yahoo returns multi-index
+if isinstance(df.columns, pd.MultiIndex):
+    df.columns = [c[0] for c in df.columns]
+
+# Standardize possible column names
+col_map = {}
+for c in df.columns:
+    lc = str(c).lower()
+    if lc == "adj close":
+        continue
+    if lc in ["open", "high", "low", "close", "volume"]:
+        col_map[c] = lc.capitalize()
+
+df = df.rename(columns=col_map)
+
+# Ensure required cols exist
+for need in ["Open", "High", "Low", "Close"]:
+    if need not in df.columns:
+        return pd.DataFrame()
+
+if "Volume" not in df.columns:
+    df["Volume"] = 0
+
+df = df[["Open","High","Low","Close","Volume"]].dropna(subset=["Open","High","Low","Close"])
+return df
+
 
 def load_daily_data(symbol: str, start: pd.Timestamp, end: pd.Timestamp, source_choice: str = "Auto (Kite if configured, else Yahoo)") -> pd.DataFrame:
     """
